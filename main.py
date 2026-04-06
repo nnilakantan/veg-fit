@@ -97,6 +97,6 @@ def main(page: ft.Page):
         recipe_results
     )
 
-# Critical: This line is required for web hosting
+# Updated for web hosting compatibility
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=8550)
