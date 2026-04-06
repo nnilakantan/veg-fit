@@ -97,6 +97,9 @@ def main(page: ft.Page):
         recipe_results
     )
 
-# Updated for web hosting compatibility
+# Replace the very bottom of your main.py with this:
 if __name__ == "__main__":
-    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=8550)
+    import os
+    # Use the port Streamlit/Render expects, or default to 8550
+    port = int(os.getenv("PORT", 8550))
+    ft.app(target=main, view=None, port=port)
