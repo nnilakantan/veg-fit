@@ -2,38 +2,48 @@ import streamlit as st
 import requests
 import datetime
 
-# 1. Page Configuration & Theme
+# 1. Page Configuration
 st.set_page_config(page_title="VEG-FIT Pro", page_icon="🥗", layout="centered")
 
 # Your Spoonacular API Key
 API_KEY = "1954fed20ccd484a87c2e25338a2bccc"
 
-# 2. Sidebar: Goal Tracking (200lbs -> 140lbs)
-with st.sidebar:
-    st.header("📉 Weight Loss Journey")
-    current_w = st.number_input("Today's Weight (lbs):", value=200.0, step=0.1)
-    
-    goal_w = 140.0
-    start_w = 200.0
-    
-    lbs_lost = start_w - current_w
-    lbs_to_go = current_w - goal_w
-    progress_pct = min(100, int((lbs_lost / (start_w - goal_w)) * 100))
-    
-    st.metric("Pounds to 140", f"{lbs_to_go:.1f} lbs", delta=f"-{lbs_lost:.1f}")
-    st.write(f"**Progress:** {progress_pct}%")
-    st.progress(progress_pct / 100)
-    
-    st.divider()
-    st.info("💡 Tip: Drink 500ml water before every meal to boost metabolism.")
-
-# 3. App Header
+# 2. APP HEADER & WEIGHT TRACKER
 st.title("🥗 VEG-FIT PRO")
 
-# 4. Detailed Weekly Workout Database
+# Weight Loss Tracker Section
+with st.container():
+    st.header("📉 Weight Loss Tracker")
+    col_w1, col_w2 = st.columns(2)
+    
+    with col_w1:
+        start_weight = 200.0
+        goal_weight = 140.0
+        # Input for current progress
+        current_weight = st.number_input("Enter Today's Weight (lbs):", value=195.0, step=0.1)
+    
+    with col_w2:
+        lbs_lost = start_weight - current_weight
+        lbs_to_go = current_weight - goal_weight
+        # Calculate progress percentage
+        progress_pct = min(100.0, max(0.0, (lbs_lost / (start_weight - goal_weight))))
+        
+        st.metric("Lbs to Goal", f"{lbs_to_go:.1f} lbs", delta=f"-{lbs_lost:.1f} Total")
+
+    # Visual Progress Bar
+    st.write(f"**Overall Progress to 140 lbs:** {int(progress_pct * 100)}%")
+    st.progress(progress_pct)
+    
+    # Cheat Meal Logic
+    days_since_start = (datetime.datetime.now() - datetime.datetime(2026, 4, 1)).days
+    days_until_cheat = 10 - (days_since_start % 10)
+    st.caption(f"🥙 Next Cheat Meal in: {days_until_cheat} days (Remember: Eat until 80% full!)")
+
+st.divider()
+
+# 3. Weekly Workout Database
 def get_workout_data():
     day = datetime.datetime.now().strftime("%A")
-    
     plans = {
         "Monday": {
             "title": "🔥 Dumbbell Strength & Boxing",
@@ -45,89 +55,77 @@ def get_workout_data():
         "Tuesday": {
             "title": "🏃 Treadmill HIIT (Fat Burn)",
             "exercises": [
-                {"name": "Interval Sprints", "reps": "10 Rounds", "img": "treadmill.jpg", "steps": ["30s Sprint (Level 7-9).", "30s Walk (Level 3).", "Focus on high knees during sprint."]}
+                {"name": "Interval Sprints", "reps": "10 Rounds", "img": "treadmill.jpg", "steps": ["30s Sprint (Fast).", "30s Walk (Slow).", "High intensity intervals."]}
             ]
         },
         "Wednesday": {
             "title": "🚣 Rowing & Core",
             "exercises": [
                 {"name": "Steady State Rowing", "reps": "15 Minutes", "img": "rowing.jpg", "steps": ["Legs -> Core -> Arms sequence.", "Maintain 22-24 strokes per minute."]},
-                {"name": "Bicycle Crunches", "reps": "3 Sets of 20", "img": "core.jpg", "steps": ["Elbow to opposite knee.", "Keep shoulder blades off the floor."]}
+                {"name": "Bicycle Crunches", "reps": "3 Sets of 20", "img": "core.jpg", "steps": ["Elbow to opposite knee.", "Slow and controlled."]}
             ]
         },
         "Thursday": {
             "title": "🚣 Endurance Rowing",
             "exercises": [
-                {"name": "Pyramid Row", "reps": "40 Minutes", "img": "rowing.jpg", "steps": ["5 min moderate / 5 min high intensity.", "Breathe rhythmically with strokes."]}
+                {"name": "Pyramid Row", "reps": "40 Minutes", "img": "rowing.jpg", "steps": ["5 min moderate / 5 min high intensity.", "Focus on breathing rhythm."]}
             ]
         },
         "Friday": {
             "title": "🏋️ Strength & Lunges",
             "exercises": [
-                {"name": "Dumbbell Thrusters", "reps": "4 Sets of 10", "img": "squat.jpg", "steps": ["Full squat then overhead press.", "Keep the motion fluid."]}
+                {"name": "Dumbbell Thrusters", "reps": "4 Sets of 10", "img": "squat.jpg", "steps": ["Full squat then overhead press.", "Keep motion fluid."]}
             ]
         },
         "Saturday": {
             "title": "🚶 Active Recovery Mix",
             "exercises": [
-                {"name": "Incline Walk", "reps": "20 Minutes", "img": "treadmill.jpg", "steps": ["3.5 mph speed.", "8% to 10% Incline.", "Pump arms; don't hold the rails."]}
+                {"name": "Incline Walk", "reps": "20 Minutes", "img": "treadmill.jpg", "steps": ["3.5 mph speed.", "8% to 10% Incline.", "Don't hold the rails."]}
             ]
         },
         "Sunday": {
             "title": "🧘 Rest & Stretch",
-            "exercises": [
-                {"name": "Yoga Flow", "reps": "20 Minutes", "img": "yoga.jpg", "steps": ["Focus on hips and lower back.", "Deep nasal breathing."]}
-            ]
+            "exercises": []
         }
     }
     return day, plans.get(day, {"title": "Rest", "exercises": []})
 
 day_name, today_plan = get_workout_data()
 
-# 5. Workout UI Display
+# 4. Workout Display
 st.header(f"📅 {day_name.upper()}: {today_plan['title']}")
 
-for ex in today_plan['exercises']:
-    with st.expander(f"💪 {ex['name']} ({ex['reps']})", expanded=True):
-        col1, col2 = st.columns([1.2, 1])
-        with col1:
-            st.write("**Instructional Steps:**")
-            for step in ex['steps']:
-                st.write(f"✅ {step}")
-            st.write(f"**Target:** {ex['reps']}")
-        with col2:
-            try:
-                st.image(ex['img'], use_container_width=True)
-            except:
-                st.warning(f"📷 Upload '{ex['img']}' to GitHub to see this visual.")
+if not today_plan['exercises']:
+    st.write("Enjoy your rest day! Maybe a light walk in Washougal?")
+else:
+    for ex in today_plan['exercises']:
+        with st.expander(f"💪 {ex['name']} ({ex['reps']})", expanded=True):
+            c1, c2 = st.columns([1.2, 1])
+            with c1:
+                for step in ex['steps']:
+                    st.write(f"✅ {step}")
+            with c2:
+                try:
+                    st.image(ex['img'], use_container_width=True)
+                except:
+                    st.warning(f"Upload '{ex['img']}' to GitHub.")
 
 st.divider()
 
-# 6. Recipe Finder Section
+# 5. Recipe Finder
 st.header("🔍 High-Protein Asian Fuel")
-ingredient = st.text_input("What ingredients are in your fridge? (e.g., Tofu, Paneer, Chickpeas)")
+ingredient = st.text_input("What's in the fridge? (e.g., Tofu, Paneer, Chickpeas)")
 
 if st.button("Search Recipes"):
     if ingredient:
-        st.write(f"Searching for vegetarian {ingredient} recipes...")
         try:
             res = requests.get("https://api.spoonacular.com/recipes/complexSearch", params={
-                "apiKey": API_KEY,
-                "includeIngredients": ingredient,
-                "cuisine": "Indian,Thai,Asian",
-                "diet": "vegetarian",
-                "number": 3,
-                "addRecipeInformation": True
+                "apiKey": API_KEY, "includeIngredients": ingredient, "cuisine": "Indian,Thai,Asian",
+                "diet": "vegetarian", "number": 3, "addRecipeInformation": True
             }).json()
-            
-            if res.get('results'):
-                for r in res['results']:
-                    with st.container():
-                        st.subheader(r['title'])
-                        st.image(r['image'], use_container_width=True)
-                        st.write(f"🔗 [View Full Recipe and Macro Info]({r['sourceUrl']})")
-                        st.divider()
-            else:
-                st.warning("No matches found. Try broadening your ingredient search!")
+            for r in res.get('results', []):
+                st.subheader(r['title'])
+                st.image(r['image'], use_container_width=True)
+                st.write(f"🔗 [View Recipe]({r['sourceUrl']})")
         except:
-            st.error("Technical glitch connecting to the recipe server. Try again in a minute!")
+            st.error("Connection error.")
