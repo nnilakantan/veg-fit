@@ -218,7 +218,7 @@ def main():
 
     # Equipment readout
     equip_badges = [pill_html(e.replace("_", " ").title(), "#8b98a5", "#1c2230") for e in sorted(MY_EQUIPMENT)]
-    st.markdown(f"**Your equipment:** {' '.join(equip_badges)}", unsafe_allow_html=True)
+st.markdown(f"**Your equipment:** {' '.join(equip_badges)}", unsafe_allow_html=True)
     st.write("") # Spacing
     
     # Generate and display the plan
