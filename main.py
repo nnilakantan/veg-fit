@@ -44,20 +44,7 @@ if "date" not in st.session_state:
 # ----------------------------------------------------------------------------------
 def pill_html(label: str, color: str = "#4ade80", bg: str = "#14301f") -> str:
     """Generates HTML for a styled pill badge to mimic Flet's UI."""
-    return f"""
-    <span style="
-        background-color: {bg}; 
-        color: {color}; 
-        padding: 4px 10px; 
-        border-radius: 20px; 
-        font-size: 11px; 
-        font-weight: 600; 
-        border: 1px solid {color}55; 
-        display: inline-block; 
-        margin: 2px;
-    ">{label}</span>
-    """
-
+    return f'<span style="background-color: {bg}; color: {color}; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; border: 1px solid {color}55; display: inline-block; margin: 2px;">{label}</span>'
 def render_animated_images(frames: list[str]):
     """Replaces the Flet asyncio ticker with native CSS animations."""
     if not frames:
