@@ -1,717 +1,719 @@
 """
-VEG-FIT Pro - workout generation engine (no UI code in here).
-
-Design notes
-------------
-* The plan is *deterministic per calendar date*: the same date always produces the
-  same workout (so refreshing the app mid-session doesn't shuffle your workout),
-  but every date produces a different one.
-
-* Session type is driven by a **9-day cycle**, not by the weekday. 9 and 7 are
-  coprime, so the weekday -> session-type mapping only repeats every 63 days.
-  That is the whole point of requirement #4: Monday is *not* "weights day".
-
-* Exercise selection additionally avoids anything used in the previous
-  ANTI_REPEAT_DAYS days, so you don't get goblet squats four sessions running.
-
-* Programming follows the mainstream evidence for fat loss: resistance training
-  is the backbone (preserve lean mass in a deficit), 2 HIIT sessions per cycle,
-  2 Zone-2 sessions, 1 true recovery day. See README.md for sources.
+engine.py - Core Training Engine for VEG-FIT Pro
+Handles exercise database indexing, 9-day periodization cycling,
+kettlebell loading strategies (10, 15, 20 lbs), and daily plan generation.
 """
 
 from __future__ import annotations
 
-import datetime as _dt
+import datetime as dt
 import json
 import os
 import random
-import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from typing import Dict, List, Optional, Set, Tuple
 
-# --------------------------------------------------------------------------------------
-# 1. YOUR CONFIG  --  edit these three things and nothing else needs to change
-# --------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
+# Global Configuration & Periodization Cycle
+# ----------------------------------------------------------------------------------
+ANTI_REPEAT_DAYS: int = 3
+BODY_WEIGHT_LB: float = 140.0
 
-# Equipment tokens. Delete a line to drop every exercise that needs it; the
-# generator re-balances automatically.
-DUMBBELLS = "dumbbells"
-PUNCH_BAG = "punching_bag"
-TREADMILL = "treadmill"
-ROWER = "rower"
-BODYWEIGHT = "bodyweight"
-BENCH = "bench"  # a weight bench, sturdy chair, step or coffee table all count
-JUMP_ROPE = "jump_rope"
+# 9-day undulating periodization cycle:
+# 3 Strength · 2 HIIT · 2 Zone 2 · 1 Metcon · 1 Recovery = 9 days
+# (9 and 7 are coprime, drifting smoothly across weekdays)
+CYCLE: List[str] = [
+    "strength",   # Day 1: Strength - Upper Body Push/Pull & Core Armor
+    "hiit",       # Day 2: HIIT - Kettlebell Swings & Anaerobic Intervals
+    "zone2",      # Day 3: Zone 2 - Aerobic Mitochondrial Base
+    "strength",   # Day 4: Strength - Lower Body Posterior Chain & Squat
+    "metcon",     # Day 5: Metcon - Full Body Kettlebell Density Complex
+    "zone2",      # Day 6: Zone 2 - Low-Impact Cardiovascular Flush
+    "strength",   # Day 7: Strength - Total Body Functional Hypertrophy
+    "hiit",       # Day 8: HIIT - Tabata Conditioning & Core
+    "recovery",   # Day 9: Active Recovery - Joint Mobility & Decompression
+]
 
-MY_EQUIPMENT: set[str] = {
-    DUMBBELLS,
-    PUNCH_BAG,
-    TREADMILL,
-    ROWER,
-    BODYWEIGHT,
-    BENCH,
-    # JUMP_ROPE,   # <- uncomment if you get one; adds rope intervals to HIIT days
+# Equipment inventory incorporating your 10, 15, and 20 lb kettlebells
+MY_EQUIPMENT: Set[str] = {
+    "body_only",
+    "kettlebells",
+    "dumbbell",
 }
 
-# Used only for the calorie estimate. Set it to your actual weight.
-BODY_WEIGHT_LB = 170
+MY_KETTLEBELLS: List[int] = [10, 15, 20]  # Available bell sizes (lbs)
+EPOCH_DATE: dt.date = dt.date(2026, 1, 1)
 
-# How many days back to look when avoiding repeat exercises.
-ANTI_REPEAT_DAYS = 5
-
-# The cycle is anchored here. Changing this date shifts which session lands on
-# which weekday, if you ever want to re-phase the program.
-CYCLE_EPOCH = _dt.date(2026, 1, 1)
-
-# --------------------------------------------------------------------------------------
-# 2. EXERCISE DATABASE  --  free-exercise-db (public domain), cached to disk
-# --------------------------------------------------------------------------------------
-
-DB_URL = "https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/dist/exercises.json"
-IMG_BASE = "https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/"
-CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exercise_db_cache.json")
-
-
-class ExerciseDB:
-    """Lazy, cached accessor for the free-exercise-db dataset.
-
-    The app is fully usable without it (you still get names, sets, reps and
-    coaching cues) - the DB only supplies demo photos and step-by-step
-    instructions, so a network failure degrades instead of crashing.
-    """
-
-    def __init__(self) -> None:
-        self._by_id: dict[str, dict] = {}
-        self.status: str = "not loaded"
-
-    def load(self) -> None:
-        if self._by_id:
-            return
-        raw = self._read_cache()
-        if raw is None:
-            raw = self._download()
-        if raw is not None:
-            self._by_id = {e["id"]: e for e in raw if "id" in e}
-
-    def _read_cache(self) -> list | None:
-        try:
-            with open(CACHE_PATH, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            if isinstance(data, list) and data:
-                self.status = f"cached ({len(data)} exercises)"
-                return data
-        except (OSError, ValueError):
-            pass
-        return None
-
-    def _download(self) -> list | None:
-        try:
-            req = urllib.request.Request(DB_URL, headers={"User-Agent": "veg-fit-pro"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
-            self.status = f"offline - demo photos unavailable ({type(exc).__name__})"
-            return None
-        try:
-            with open(CACHE_PATH, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
-        except OSError:
-            pass  # read-only dir is fine, we just re-download next time
-        self.status = f"downloaded ({len(data)} exercises)"
-        return data
-
-    def entry(self, db_id: str | None) -> dict:
-        if not db_id:
-            return {}
-        return self._by_id.get(db_id, {})
-
-    def images(self, db_id: str | None) -> list[str]:
-        """Absolute URLs for the start/end frames of the movement."""
-        return [IMG_BASE + p for p in self.entry(db_id).get("images", [])]
-
-    def instructions(self, db_id: str | None) -> list[str]:
-        return list(self.entry(db_id).get("instructions", []))
-
-    def muscles(self, db_id: str | None) -> list[str]:
-        e = self.entry(db_id)
-        return list(e.get("primaryMuscles", [])) + list(e.get("secondaryMuscles", []))
-
-
-def video_search_url(name: str) -> str:
-    q = urllib.parse.quote_plus(f"{name} proper form technique tutorial")
-    return f"https://www.youtube.com/results?search_query={q}"
-
-
-# --------------------------------------------------------------------------------------
-# 3. MOVEMENT CATALOG
-# --------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
+# ----------------------------------------------------------------------------------
+# Data Models
+# ----------------------------------------------------------------------------------
+@dataclass
 class Move:
-    """One movement we know how to program.
-
-    ``db_id`` links to free-exercise-db for photos + instructions. A few
-    movements (heavy-bag rounds, machine interval protocols) have no honest
-    match in that dataset; those carry ``db_id=None`` and rely on our own cue
-    text plus the video link.
-    """
-
-    key: str
     name: str
-    cue: str
-    equip: frozenset[str]
-    db_id: str | None = None
-    note: str = ""  # shown when the stock photo differs from what you'll do
-
-    @property
-    def video_url(self) -> str:
-        return video_search_url(self.name)
-
-
-def _m(key, name, cue, equip, db_id="__same__", note="") -> Move:
-    return Move(
-        key=key,
-        name=name,
-        cue=cue,
-        equip=frozenset(equip),
-        db_id=key if db_id == "__same__" else db_id,
-        note=note,
-    )
-
-
-D, B, T, R, W, BN, JR = DUMBBELLS, PUNCH_BAG, TREADMILL, ROWER, BODYWEIGHT, BENCH, JUMP_ROPE
-
-# --- knee-dominant ---------------------------------------------------------------------
-SQUAT = [
-    _m("Goblet_Squat", "Goblet Squat", "Dumbbell at your chest, elbows inside your knees, sit straight down.", [D]),
-    _m("Dumbbell_Squat", "Dumbbell Squat", "Weights at your sides, chest tall, knees tracking over your toes.", [D]),
-    _m("Dumbbell_Lunges", "Dumbbell Lunge", "Step back, drop the back knee straight down, drive through the front heel.", [D]),
-    _m("Dumbbell_Step_Ups", "Dumbbell Step-Up", "Whole foot on the step. Do NOT push off the trailing leg.", [D, BN]),
-    _m("Dumbbell_Squat_To_A_Bench", "Dumbbell Box Squat", "Sit to the bench, pause a beat, stand without rocking.", [D, BN]),
-    _m("Bodyweight_Walking_Lunge", "Walking Lunge", "Long strides, torso upright, control the descent.", [W]),
-    _m("Bodyweight_Squat", "Bodyweight Squat", "Slow 3-count down, drive up fast. Squeeze glutes at the top.", [W]),
-    _m("Sit_Squats", "Deep Sit Squat", "Heels down, sink into the hole and hold - a mobility squat.", [W]),
-]
-
-# --- hip-dominant ----------------------------------------------------------------------
-HINGE = [
-    _m("Romanian_Deadlift", "Dumbbell Romanian Deadlift", "Push your hips back, soft knees, dumbbells brushing your thighs.",
-       [D], note="Stock photo shows a barbell - do the identical hinge holding dumbbells."),
-    _m("Dumbbell_Clean", "Dumbbell Clean", "Explosive hip snap, then catch the weights at your shoulders.", [D]),
-    _m("Butt_Lift_Bridge", "Glute Bridge", "Ribs down, squeeze the glutes hard at the top for a full second.", [W]),
-    _m("Natural_Glute_Ham_Raise", "Nordic / Glute-Ham Raise", "Anchor your feet, lower as slowly as you can, catch with your hands.", [W]),
-    _m("Glute_Kickback", "Glute Kickback", "Back flat. Drive the heel to the ceiling - no arching the lower back.", [W]),
-]
-
-# --- horizontal push --------------------------------------------------------------------
-PUSH_H = [
-    _m("Dumbbell_Bench_Press", "Dumbbell Bench Press", "Wrists stacked over elbows, lower until your elbows pass your ribs.", [D, BN]),
-    _m("Dumbbell_Floor_Press", "Dumbbell Floor Press", "Triceps tap the floor, pause, then press. Great on a joint-cranky day.", [D]),
-    _m("Dumbbell_Flyes", "Dumbbell Fly", "Big arc, slight elbow bend, stretch the chest - go light here.", [D, BN]),
-    _m("Pushups", "Push-Up", "Body in one line, elbows about 45 degrees from your ribs.", [W]),
-    _m("Push-Up_Wide", "Wide Push-Up", "Hands wider than shoulders - more chest, less triceps.", [W]),
-    _m("Push_Up_to_Side_Plank", "Push-Up to Side Plank", "Press up, then rotate open and reach for the ceiling.", [W]),
-    _m("Incline_Push-Up", "Incline Push-Up", "Hands elevated. Use this to keep reps clean once you fatigue.", [W, BN]),
-    _m("Decline_Push-Up", "Decline Push-Up", "Feet elevated. Shifts load to the upper chest and shoulders.", [W, BN]),
-    _m("Plyo_Push-up", "Plyometric Push-Up", "Push hard enough that your hands leave the floor. Land soft.", [W]),
-]
-
-# --- vertical push ----------------------------------------------------------------------
-PUSH_V = [
-    _m("Dumbbell_Shoulder_Press", "Dumbbell Shoulder Press", "Brace your abs so your lower back doesn't arch as you press.", [D]),
-    _m("Arnold_Dumbbell_Press", "Arnold Press", "Start palms-in, rotate out as you press. Slow and deliberate.", [D]),
-    _m("Side_Lateral_Raise", "Lateral Raise", "Lead with your elbows, stop at shoulder height, no swinging.", [D]),
-    _m("Front_Dumbbell_Raise", "Front Raise", "Straight arms to eye level, lower under control over 3 seconds.", [D]),
-]
-
-# --- pull ---------------------------------------------------------------------------------
-PULL = [
-    _m("Bent_Over_Two-Dumbbell_Row", "Bent-Over Dumbbell Row", "Hinge to ~45 degrees, flat back, row to your hips not your chest.", [D]),
-    _m("One-Arm_Dumbbell_Row", "One-Arm Dumbbell Row", "Brace on the bench, pull the elbow past your ribs, squeeze.", [D, BN]),
-    _m("Dumbbell_Incline_Row", "Incline Dumbbell Row", "Chest supported - removes all lower-back cheating.", [D, BN]),
-    _m("Dumbbell_One-Arm_Upright_Row", "One-Arm Upright Row", "Elbow leads, keep the weight close to your body.", [D]),
-    _m("Bodyweight_Mid_Row", "Inverted / Table Row", "Use a sturdy table edge. Body straight, chest to the edge.", [W]),
-    _m("Dumbbell_Lying_Rear_Lateral_Raise", "Lying Rear Delt Raise", "Face down on the bench, thumbs up, raise wide.", [D, BN]),
-    _m("Bent_Over_Dumbbell_Rear_Delt_Raise_With_Head_On_Bench", "Supported Rear Delt Raise",
-       "Forehead on the bench takes momentum out - rear delts do all the work.", [D, BN]),
-    _m("Dumbbell_Shrug", "Dumbbell Shrug", "Straight up, pause one second at the top, no rolling.", [D]),
-]
-
-# --- arms ------------------------------------------------------------------------------
-ARMS = [
-    _m("Dumbbell_Bicep_Curl", "Dumbbell Curl", "Elbows pinned to your sides, no swinging the torso.", [D]),
-    _m("Hammer_Curls", "Hammer Curl", "Neutral grip. Hits the brachialis - makes the arm look thicker.", [D]),
-    _m("Alternate_Hammer_Curl", "Alternating Hammer Curl", "One arm at a time, full lockout at the bottom.", [D]),
-    _m("Cross_Body_Hammer_Curl", "Cross-Body Hammer Curl", "Curl across to the opposite shoulder.", [D]),
-    _m("Concentration_Curls", "Concentration Curl", "Elbow braced on your thigh. Peak-contraction squeeze.", [D, BN]),
-    _m("Tricep_Dumbbell_Kickback", "Triceps Kickback", "Upper arm locked parallel to the floor, extend from the elbow only.", [D]),
-    _m("Lying_Dumbbell_Tricep_Extension", "Lying Triceps Extension", "Lower to your forehead, elbows pointing at the ceiling.", [D, BN]),
-    _m("Bench_Dips", "Bench Dip", "Hips close to the bench, elbows straight back to 90 degrees.", [W, BN]),
-    _m("Close-Grip_Push-Up_off_of_a_Dumbbell", "Close-Grip Push-Up", "Hands on the dumbbells, elbows tight to your ribs.", [D]),
-]
-
-# --- core ------------------------------------------------------------------------------
-CORE = [
-    _m("Plank", "Plank", "Squeeze glutes and abs. Hips level - no sagging, no piking.", [W]),
-    _m("Side_Bridge", "Side Plank", "Stack your feet, drive the bottom hip to the ceiling.", [W]),
-    _m("Russian_Twist", "Russian Twist", "Lean back to ~45 degrees, rotate from the ribs not the arms.", [W]),
-    _m("Air_Bike", "Bicycle Crunch", "Slow. Opposite elbow to knee, fully extend the other leg.", [W]),
-    _m("Crunches", "Crunch", "Curl the ribs toward the hips - don't yank on your neck.", [W]),
-    _m("Cross-Body_Crunch", "Cross-Body Crunch", "Rotate through the obliques, pause at the top.", [W]),
-    _m("Reverse_Crunch", "Reverse Crunch", "Lift the hips off the floor using your abs, not momentum.", [W]),
-    _m("Bent-Knee_Hip_Raise", "Bent-Knee Hip Raise", "Small, controlled - it's a curl of the pelvis, not a leg throw.", [W]),
-    _m("Superman", "Superman", "Lift arms and legs together, hold two seconds. Balances all that flexion.", [W]),
-    _m("Spider_Crawl", "Spider Crawl", "Plank position, drive the knee to the same-side elbow.", [W]),
-    _m("Decline_Crunch", "Decline Crunch", "Feet anchored. Control the way down, don't drop.", [W, BN]),
-    _m("Scissor_Kick", "Scissor Kick", "Lower back pressed flat into the floor the entire time.", [W]),
-    _m("Lower_Back_Curl", "Lower Back Curl", "Gentle extension - a good counterbalance to crunch work.", [W]),
-    _m("Dumbbell_Side_Bend", "Dumbbell Side Bend", "One dumbbell only. Bend sideways, don't twist.", [D]),
-    _m("Plate_Twist", "Weighted Russian Twist", "Hold one dumbbell, tap either side of your hips.",
-       [D], note="Stock photo uses a plate - hold a dumbbell instead."),
-]
-
-# --- plyometric / explosive --------------------------------------------------------------
-PLYO = [
-    _m("Knee_Tuck_Jump", "Tuck Jump", "Explode up, knees to chest, land softly through the whole foot.", [W]),
-    _m("Rocket_Jump", "Rocket Jump", "Dip, then jump as high as you can with arms overhead.", [W]),
-    _m("Lateral_Bound", "Lateral Bound", "Skater-style. Push off sideways, stick the landing on one leg.", [W]),
-    _m("Scissors_Jump", "Scissor / Split Jump", "Lunge, jump, swap legs mid-air. Soft, quiet landings.", [W]),
-    _m("Freehand_Jump_Squat", "Jump Squat", "Squat to parallel, jump, absorb the landing back into a squat.", [W]),
-    _m("Mountain_Climbers", "Mountain Climbers", "Hips low and still. Drive the knees fast.", [W]),
-    _m("Bench_Jump", "Bench / Box Jump", "Jump up, STEP down. Never jump down - that's how ankles go.", [W, BN]),
-    _m("Wind_Sprints", "Shuttle Sprints", "All-out for the work interval, then walk it off completely.", [W]),
-]
-
-# --- loaded carries / finishers ------------------------------------------------------------
-CARRY = [
-    _m("Farmers_Walk", "Farmer's Walk", "Heaviest dumbbells you own, shoulders back, walk tall and don't lean.",
-       [D], note="Stock photo shows a strongman implement - dumbbells work identically."),
-]
-
-# --- cardio machines & the bag ---------------------------------------------------------------
-CARDIO_HARD = [
-    _m("Running_Treadmill", "Treadmill Sprint", "Hop onto the rails to start/stop the interval - don't decelerate the belt.", [T]),
-    _m("Rowing_Stationary", "Rowing Machine", "Legs, then hips, then arms. Reverse the order on the recovery.", [R]),
-    _m("Rope_Jumping", "Jump Rope", "Wrists do the turning, small hops, stay on the balls of your feet.", [JR]),
-    _m("Heavy_Bag_Thrust", "Heavy Bag Thrust", "Explosive two-hand shove into the bag, catch it and repeat.", [B]),
-]
-CARDIO_STEADY = [
-    _m("Jogging_Treadmill", "Treadmill Jog", "Conversational pace - you should be able to speak in full sentences.", [T]),
-    _m("Walking_Treadmill", "Incline Treadmill Walk", "10-15% incline, 3-3.5 mph, hands OFF the rails.", [T]),
-    _m("Rowing_Stationary", "Steady-State Row", "Aim for 22-24 strokes/min. Long, smooth, unhurried drives.", [R]),
-    _m("Trail_Running_Walking", "Outdoor Walk / Jog", "Get outside. Nose-breathing pace.", [W]),
-]
-
-# Bag work has no honest match in the photo dataset, so these carry db_id=None:
-# you get the written protocol plus a video link instead of a still photo.
-BAG_WORK = [
-    Move("bag_rounds", "Heavy Bag Rounds",
-         "Hands up, chin down, rotate your hips into every punch. Never punch with a flat, locked arm.",
-         frozenset([B]), None),
-    Move("bag_combos", "Heavy Bag Power Combos",
-         "1-2, 1-2-3, then a hook off the back foot. Reset your stance between combos.",
-         frozenset([B]), None),
-    Move("bag_speed", "Heavy Bag Speed Bursts",
-         "Fastest hands you have for the burst, light contact. Speed over power.",
-         frozenset([B]), None),
-    Move("bag_technique", "Heavy Bag Technique Work",
-         "Slow, deliberate reps. Film yourself once - most form errors are invisible from the inside.",
-         frozenset([B]), None),
-]
-
-# --- warm-up (dynamic) --------------------------------------------------------------------
-WARMUP = [
-    _m("Arm_Circles", "Arm Circles", "20 forward, 20 back. Progressively bigger.", [W]),
-    _m("Shoulder_Circles", "Shoulder Rolls", "Big slow circles, front and back.", [W]),
-    _m("Elbow_Circles", "Elbow Circles", "Opens the elbows and biceps before any pressing.", [W]),
-    _m("Ankle_Circles", "Ankle Circles", "Both directions. Cheap insurance before jumping or sprinting.", [W]),
-    _m("Knee_Circles", "Knee Circles", "Hands on knees, small controlled circles.", [W]),
-    _m("Hip_Circles_prone", "Hip Circles", "Big circles - the hips need the most warming of anything.", [W]),
-    _m("Groiners", "Groiners", "Plank, step the foot outside the hand, drop the hip.", [W]),
-    _m("Inchworm", "Inchworm", "Walk your hands out to a plank, walk your feet in. Repeat.", [W]),
-    _m("Front_Leg_Raises", "Leg Swings (front)", "Controlled swings - momentum, not force.", [W]),
-    _m("Rear_Leg_Raises", "Leg Swings (back)", "Squeeze the glute at the top of each swing.", [W]),
-    _m("Side_Leg_Raises", "Lateral Leg Swings", "Opens the adductors before any lateral work.", [W]),
-    _m("Dynamic_Chest_Stretch", "Dynamic Chest Opener", "Swing the arms wide and cross - build the range gradually.", [W]),
-    _m("Dynamic_Back_Stretch", "Dynamic Back Stretch", "Reach and round, then extend. Wake the spine up.", [W]),
-    _m("Crossover_Reverse_Lunge", "Crossover Reverse Lunge", "Step back and across - hits the glute medius.", [W]),
-    _m("Iron_Crosses_stretch", "Iron Crosses", "On your back, cross the leg over. Shoulders stay down.", [W]),
-    _m("Frog_Hops", "Frog Hops", "Deep squat, small hop forward. Great pre-plyo.", [W]),
-    _m("Round_The_World_Shoulder_Stretch", "Round-the-World Shoulders", "Full shoulder circumduction.", [W]),
-]
-
-# --- cool-down (static) -------------------------------------------------------------------
-COOLDOWN = [
-    _m("Childs_Pose", "Child's Pose", "Sit back onto your heels, breathe into your back for 30-45s.", [W]),
-    _m("Cat_Stretch", "Cat-Cow", "Slow, on the breath. Round on the exhale, arch on the inhale.", [W]),
-    _m("Seated_Hamstring", "Seated Hamstring Stretch", "Hinge from the hips, flat back. Never round to reach further.", [W]),
-    _m("Lying_Glute", "Lying Glute Stretch", "Figure-4, pull the supporting thigh toward you.", [W]),
-    _m("Kneeling_Hip_Flexor", "Kneeling Hip Flexor Stretch", "Tuck your tailbone under FIRST, then lean. Huge difference.", [W]),
-    _m("Overhead_Triceps", "Overhead Triceps Stretch", "Elbow to the ceiling, gently pull with the other hand.", [W]),
-    _m("Overhead_Lat", "Overhead Lat Stretch", "Reach and side-bend away. Breathe into the ribs.", [W]),
-    _m("Quad_Stretch", "Standing Quad Stretch", "Knees together, push the hip forward.", [W]),
-    _m("Runners_Stretch", "Runner's Stretch", "Deep lunge, back heel reaching down.", [W]),
-    _m("Seated_Calf_Stretch", "Seated Calf Stretch", "Pull the toes toward you, knee straight.", [W]),
-    _m("One_Knee_To_Chest", "Knee to Chest", "One at a time, other leg flat on the floor.", [W]),
-    _m("Hug_Knees_To_Chest", "Double Knee Hug", "Rock gently side to side to massage the lower back.", [W]),
-    _m("Chin_To_Chest_Stretch", "Neck Flexion Stretch", "Slow. No pulling hard on the head.", [W]),
-    _m("Side_Neck_Stretch", "Lateral Neck Stretch", "Ear toward shoulder, opposite hand reaching down.", [W]),
-    _m("Behind_Head_Chest_Stretch", "Chest Stretch", "Hands behind head, drive the elbows back.", [W]),
-    _m("Middle_Back_Stretch", "Mid-Back Stretch", "Round forward and reach - separate the shoulder blades.", [W]),
-    _m("Seated_Glute", "Seated Glute Stretch", "Ankle on knee, sit tall, hinge forward.", [W]),
-    _m("90_90_Hamstring", "90/90 Hamstring Stretch", "Hip and knee at 90, straighten the knee slowly.", [W]),
-    _m("Lying_Crossover", "Supine Spinal Twist", "Both shoulders stay on the floor. Exhale into it.", [W]),
-    _m("Knee_Across_The_Body", "Knee Across Body", "Gentle rotation for the lower back and glute.", [W]),
-    _m("Calf_Stretch_Hands_Against_Wall", "Wall Calf Stretch", "Back heel down, back knee straight.", [W]),
-    _m("Intermediate_Hip_Flexor_and_Quad_Stretch", "Couch Stretch", "The one that hurts if you sit all day. Do it anyway.", [W]),
-]
-
-
-def _available(pool: Sequence[Move]) -> list[Move]:
-    return [m for m in pool if m.equip <= MY_EQUIPMENT]
-
-
-# --------------------------------------------------------------------------------------
-# 4. PLAN DATA MODEL
-# --------------------------------------------------------------------------------------
+    db_id: str
+    cue: str = ""
+    note: str = ""
+    video_url: str = ""
+    equipment: str = "body_only"
+    category: str = "strength"
+    primary_muscles: List[str] = field(default_factory=list)
+    secondary_muscles: List[str] = field(default_factory=list)
+    instructions: List[str] = field(default_factory=list)
+    images: List[str] = field(default_factory=list)
 
 
 @dataclass
 class Item:
     move: Move
-    dose: str  # "4 x 8-10" / "8 rounds: 30s hard / 30s easy"
-    detail: str = ""  # RPE, rest, tempo
+    dose: str
+    detail: str = ""
 
 
 @dataclass
 class Block:
     title: str
     subtitle: str
-    items: list[Item] = field(default_factory=list)
+    items: List[Item]
 
 
 @dataclass
 class Plan:
-    date: _dt.date
-    cycle_day: int
-    kind: str  # strength | hiit | metcon | zone2 | recovery
+    date: dt.date
+    kind: str
     title: str
     focus: str
+    why: str
     minutes: int
-    blocks: list[Block]
-    why: str  # why this session exists in a fat-loss program
-
-    @property
-    def main_keys(self) -> set[str]:
-        """Keys used in the main work - what the anti-repeat logic looks at."""
-        return {
-            it.move.key
-            for b in self.blocks
-            if b.title not in ("Warm-Up", "Cool-Down")
-            for it in b.items
-        }
-
-    @property
-    def calorie_estimate(self) -> tuple[int, int]:
-        met = {"strength": 5.0, "hiit": 9.0, "metcon": 8.0, "zone2": 6.5, "recovery": 3.3}[self.kind]
-        kg = BODY_WEIGHT_LB * 0.4536
-        kcal = met * 3.5 * kg / 200.0 * self.minutes
-        return int(kcal * 0.85), int(kcal * 1.15)
+    calorie_estimate: Tuple[int, int]
+    cycle_day: int
+    blocks: List[Block]
 
 
-# --------------------------------------------------------------------------------------
-# 5. GENERATOR
-# --------------------------------------------------------------------------------------
+@dataclass
+class PlanSummary:
+    date: dt.date
+    kind: str
+    title: str
 
-# 9-day cycle. 9 is coprime with 7, so the weekday -> session mapping takes
-# 63 days to come back around: "every Monday is weights" cannot happen.
-CYCLE = [
-    ("strength", "Full-Body Strength Circuit", "Total body - metabolic circuit", 45),
-    ("hiit", "HIIT Intervals", "Cardio - maximum intensity", 28),
-    ("zone2", "Zone 2 Steady State", "Cardio - fat oxidation + core", 45),
-    ("strength", "Upper Body Strength", "Chest, back, shoulders, arms + core", 45),
-    ("metcon", "Metabolic Conditioning", "Full body - AMRAP + EMOM", 35),
-    ("recovery", "Active Recovery & Mobility", "Restoration - keep the deficit, drop the stress", 30),
-    ("strength", "Lower Body Strength", "Quads, hamstrings, glutes + core", 45),
-    ("hiit", "HIIT Intervals", "Cardio - maximum intensity (different modality)", 28),
-    ("zone2", "Long Zone 2 + Core", "Cardio - longest aerobic piece of the cycle", 55),
+# ----------------------------------------------------------------------------------
+# Curated Exercise Library (Free-Exercise-DB Schema Compatible)
+# ----------------------------------------------------------------------------------
+BASE_GITHUB_IMG = "https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises"
+
+CURATED_EXERCISES: List[Dict] = [
+    # --- Kettlebell Essentials (10, 15, 20 lb) ---
+    {
+        "id": "kb_two_arm_swing",
+        "name": "Kettlebell Two-Arm Swing",
+        "equipment": "kettlebells",
+        "category": "strength",
+        "primaryMuscles": ["glutes", "hamstrings", "lower back"],
+        "secondaryMuscles": ["shoulders", "abs", "forearms"],
+        "cue": "Hinge at the hips with a flat back; snap hips violently forward. Power comes from glutes, not arms.",
+        "note": "Use your 20 lb bell for explosive hip power. Keep the bell above knee level on the backswing.",
+        "video_url": "https://www.youtube.com/results?search_query=kettlebell+two+arm+swing+form",
+        "instructions": [
+            "Stand with feet slightly wider than shoulder-width, kettlebell on the floor 1 foot in front of you.",
+            "Hinge hips back with a soft knee bend, grabbing the handle with both hands.",
+            "Hike the kettlebell back between your legs like a center in football.",
+            "Drive your feet through the floor and snap your hips forward to full vertical standing lock.",
+            "Let the bell float up to chest height on momentum; guide it back into the hinge."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Kettlebell_Swing/0.jpg",
+            f"{BASE_GITHUB_IMG}/Kettlebell_Swing/1.jpg"
+        ]
+    },
+    {
+        "id": "kb_goblet_squat",
+        "name": "Kettlebell Goblet Squat",
+        "equipment": "kettlebells",
+        "category": "strength",
+        "primaryMuscles": ["quadriceps", "glutes"],
+        "secondaryMuscles": ["calves", "abdominals", "upper back"],
+        "cue": "Hold horns tight against sternum; pry knees apart with elbows in the bottom hole.",
+        "note": "Great with either the 15 lb or 20 lb bell. Keep chest proud and spine neutral.",
+        "video_url": "https://www.youtube.com/results?search_query=kettlebell+goblet+squat+technique",
+        "instructions": [
+            "Hold the kettlebell close to your chest by the horns or ball with elbows tucked.",
+            "Set your feet shoulder-width apart, toes turned slightly out (15-30 degrees).",
+            "Inhale deep into your belly, descend by sending hips back and spreading your knees.",
+            "Reach parallel or deeper while maintaining an upright torso.",
+            "Drive out of the hole through mid-foot and heel to stand tall."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Goblet_Squat/0.jpg",
+            f"{BASE_GITHUB_IMG}/Goblet_Squat/1.jpg"
+        ]
+    },
+    {
+        "id": "kb_single_arm_clean_press",
+        "name": "Kettlebell Clean & Strict Press",
+        "equipment": "kettlebells",
+        "category": "strength",
+        "primaryMuscles": ["shoulders", "triceps", "upper back"],
+        "secondaryMuscles": ["glutes", "core", "forearms"],
+        "cue": "Zip the jacket up to clean into rack position; crush the handle and press vertically overhead.",
+        "note": "Use 10 lb bell for strict overhead control, or 15 lb as strength builds.",
+        "video_url": "https://www.youtube.com/results?search_query=kettlebell+clean+and+press",
+        "instructions": [
+            "Hinge and grab the bell single-handed; hike back and snap hips to clean into the front rack.",
+            "In rack position, forearm is vertical, wrist straight, thumb tucked near collarbone.",
+            "Squeeze glutes and abs tight to create a solid pillar.",
+            "Press the bell smoothly overhead to full elbow lockout without leaning back.",
+            "Lower slowly under control back into the rack position."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Clean_and_press/0.jpg",
+            f"{BASE_GITHUB_IMG}/Clean_and_press/1.jpg"
+        ]
+    },
+    {
+        "id": "kb_single_arm_row",
+        "name": "Kettlebell Gorilla Row",
+        "equipment": "kettlebells",
+        "category": "strength",
+        "primaryMuscles": ["lats", "rhomboids"],
+        "secondaryMuscles": ["biceps", "core", "hamstrings"],
+        "cue": "Drive elbow towards hip pocket; keep opposing shoulder square and resist torso rotation.",
+        "note": "Best with 15 lb or 20 lb bell. Focus on lat contraction at the top.",
+        "video_url": "https://www.youtube.com/results?search_query=kettlebell+gorilla+row",
+        "instructions": [
+            "Hinge into a wide deadlift stance with bell between your feet.",
+            "Grab the handle with one hand while stabilizing through flat back.",
+            "Pull elbow back towards ribcage without twisting your spine.",
+            "Pause for 1 second at apex contraction, then return down with control."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Kettlebell_One-Arm_Row/0.jpg",
+            f"{BASE_GITHUB_IMG}/Kettlebell_One-Arm_Row/1.jpg"
+        ]
+    },
+    {
+        "id": "kb_halo",
+        "name": "Kettlebell Standing Halo",
+        "equipment": "kettlebells",
+        "category": "strength",
+        "primaryMuscles": ["shoulders", "neck", "abdominals"],
+        "secondaryMuscles": ["rotator cuff", "upper back"],
+        "cue": "Circle the bell tight around your head like crown; keep ribs glued down and core locked.",
+        "note": "Use the 10 lb bell to lubricate shoulders and build scapular resilience.",
+        "video_url": "https://www.youtube.com/results?search_query=kettlebell+halo+form",
+        "instructions": [
+            "Hold bell upside down by horns at upper chest level.",
+            "Brace core firmly and orbit the bell closely around your ear, behind neck, and around opposite ear.",
+            "Minimize neck and ribcage swaying; move smoothly through full 360-degree rotation.",
+            "Alternate clockwise and counterclockwise repetitions."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Kettlebell_Halo/0.jpg",
+            f"{BASE_GITHUB_IMG}/Kettlebell_Halo/1.jpg"
+        ]
+    },
+    {
+        "id": "kb_turkish_get_up",
+        "name": "Kettlebell Turkish Get-Up (Half or Full)",
+        "equipment": "kettlebells",
+        "category": "strength",
+        "primaryMuscles": ["shoulders", "abdominals", "quadriceps"],
+        "secondaryMuscles": ["glutes", "forearms", "stabilizers"],
+        "cue": "Eyes glued to bell knuckles throughout movement; keep supporting arm bone-stacked.",
+        "note": "Use the 10 lb bell for premier shoulder stability and functional core control.",
+        "video_url": "https://www.youtube.com/results?search_query=turkish+get+up+step+by+step",
+        "instructions": [
+            "Lie flat with bell pressed straight up in right arm; right knee bent, foot flat.",
+            "Roll up diagonally onto left forearm, then press onto left palm.",
+            "Bridge hips up, sweep left leg under to kneel in half-kneeling lunge.",
+            "Stand tall while maintaining vertical bell lockout overhead.",
+            "Reverse each milestone carefully back to floor."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Turkish_Get_Up/0.jpg",
+            f"{BASE_GITHUB_IMG}/Turkish_Get_Up/1.jpg"
+        ]
+    },
+    {
+        "id": "kb_romanian_deadlift",
+        "name": "Kettlebell Romanian Deadlift",
+        "equipment": "kettlebells",
+        "category": "strength",
+        "primaryMuscles": ["hamstrings", "glutes"],
+        "secondaryMuscles": ["lower back", "lats", "forearms"],
+        "cue": "Push hips back towards back wall; soft knees, shins vertical, feel deep hamstring stretch.",
+        "note": "Prime candidate for 20 lb bell. Pack lats tight to protect spine.",
+        "video_url": "https://www.youtube.com/results?search_query=kettlebell+romanian+deadlift",
+        "instructions": [
+            "Hold kettlebell by handle with both hands in front of thighs.",
+            "Hinge hips back while keeping knees softly unlocked and spine straight.",
+            "Lower bell just past kneecaps until maximum hamstring tension is achieved.",
+            "Drive hips forward to return to standing lockout."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Romanian_Deadlift/0.jpg",
+            f"{BASE_GITHUB_IMG}/Romanian_Deadlift/1.jpg"
+        ]
+    },
+    {
+        "id": "kb_russian_twist",
+        "name": "Kettlebell Russian Twist",
+        "equipment": "kettlebells",
+        "category": "strength",
+        "primaryMuscles": ["abdominals", "obliques"],
+        "secondaryMuscles": ["lower back", "hip flexors"],
+        "cue": "Rotate from upper ribcage, not just moving arms; keep heels hovering or lightly anchored.",
+        "note": "Use 10 lb or 15 lb bell. Keep control over speed to protect lower back.",
+        "video_url": "https://www.youtube.com/results?search_query=kettlebell+russian+twist",
+        "instructions": [
+            "Sit on floor with knees bent, torso reclined back at 45 degrees.",
+            "Hold kettlebell at chest with both hands.",
+            "Rotate torso smoothly from left hip to right hip under steady tension."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Russian_Twist/0.jpg",
+            f"{BASE_GITHUB_IMG}/Russian_Twist/1.jpg"
+        ]
+    },
+    {
+        "id": "kb_suitcase_carry",
+        "name": "Kettlebell Suitcase Carry",
+        "equipment": "kettlebells",
+        "category": "strength",
+        "primaryMuscles": ["obliques", "forearms", "traps"],
+        "secondaryMuscles": ["glutes", "calves"],
+        "cue": "Walk tall like proud royalty; resist leaning sideways toward the loaded side.",
+        "note": "Challenge yourself with the 20 lb bell for intense lateral core anti-flexion.",
+        "video_url": "https://www.youtube.com/results?search_query=suitcase+carry+kettlebell",
+        "instructions": [
+            "Deadlift bell with one hand by side like a suitcase.",
+            "Keep shoulders level and posture tall; walk smoothly for distance or time.",
+            "Turn around, switch hands and repeat."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Farmers_Walk/0.jpg",
+            f"{BASE_GITHUB_IMG}/Farmers_Walk/1.jpg"
+        ]
+    },
+    {
+        "id": "kb_windmill",
+        "name": "Kettlebell Windmill",
+        "equipment": "kettlebells",
+        "category": "strength",
+        "primaryMuscles": ["obliques", "shoulders", "hamstrings"],
+        "secondaryMuscles": ["rotator cuff", "glutes"],
+        "cue": "Push hip back in direction of bell; slide bottom hand down inside front leg.",
+        "note": "Use the 10 lb bell to master flexibility and shoulder stability.",
+        "video_url": "https://www.youtube.com/results?search_query=kettlebell+windmill",
+        "instructions": [
+            "Press kettlebell overhead with right arm; turn feet 45 degrees away from bell.",
+            "Shift right hip back, keeping right arm locked straight toward ceiling.",
+            "Slide left hand down inside left leg towards floor while looking at bell.",
+            "Engage glutes to reverse back up to starting position."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Windmills/0.jpg",
+            f"{BASE_GITHUB_IMG}/Windmills/1.jpg"
+        ]
+    },
+    # --- Bodyweight Calisthenics & Cardio Engine ---
+    {
+        "id": "bw_pushups",
+        "name": "Standard Push-Up (Tempo)",
+        "equipment": "body_only",
+        "category": "strength",
+        "primaryMuscles": ["chest", "triceps"],
+        "secondaryMuscles": ["shoulders", "core"],
+        "cue": "Body forms a rigid plank from crown to heels; elbows track at 45-degree angle.",
+        "note": "Control the 2-second eccentric phase for maximum hypertrophy.",
+        "video_url": "https://www.youtube.com/results?search_query=push+up+proper+form",
+        "instructions": [
+            "Start in high plank with hands directly beneath shoulders.",
+            "Lower chest to floor while bracing glutes and quadriceps.",
+            "Press explosively back to top lockout."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Pushups/0.jpg",
+            f"{BASE_GITHUB_IMG}/Pushups/1.jpg"
+        ]
+    },
+    {
+        "id": "bw_mountain_climbers",
+        "name": "Speed Mountain Climbers",
+        "equipment": "body_only",
+        "category": "cardio",
+        "primaryMuscles": ["abdominals", "hip flexors"],
+        "secondaryMuscles": ["shoulders", "quadriceps"],
+        "cue": "Drive knees toward chest without bouncing hips; maintain stable plank.",
+        "note": "Great for HIIT intervals and cardiovascular output.",
+        "video_url": "https://www.youtube.com/results?search_query=mountain+climbers+exercise",
+        "instructions": [
+            "Hold push-up position with hands flat on floor.",
+            "Quickly alternate driving knees forward towards chest in running motion."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Mountain_climbers/0.jpg",
+            f"{BASE_GITHUB_IMG}/Mountain_climbers/1.jpg"
+        ]
+    },
+    {
+        "id": "bw_air_squats",
+        "name": "Bodyweight Tempo Air Squat",
+        "equipment": "body_only",
+        "category": "strength",
+        "primaryMuscles": ["quadriceps", "glutes"],
+        "secondaryMuscles": ["calves", "core"],
+        "cue": "Sink between hips with upright spine; track knees over outer toes.",
+        "note": "Excellent for warm-up or high-volume conditioning.",
+        "video_url": "https://www.youtube.com/results?search_query=air+squat+form",
+        "instructions": [
+            "Stand tall, feet shoulder-width apart.",
+            "Squat down until thighs break parallel, keeping arms out for balance.",
+            "Stand tall and squeeze glutes at the top."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Bodyweight_Squat/0.jpg",
+            f"{BASE_GITHUB_IMG}/Bodyweight_Squat/1.jpg"
+        ]
+    },
+    {
+        "id": "rec_world_greatest_stretch",
+        "name": "World's Greatest Hip & Thoracic Stretch",
+        "equipment": "body_only",
+        "category": "stretching",
+        "primaryMuscles": ["hip flexors", "hamstrings", "lats"],
+        "secondaryMuscles": ["thoracic spine", "glutes"],
+        "cue": "Elbow down inside front instep, rotate upper arm to ceiling, exhale into stretch.",
+        "note": "Unrivaled joint opener before lifting or on active recovery days.",
+        "video_url": "https://www.youtube.com/results?search_query=worlds+greatest+stretch",
+        "instructions": [
+            "Step into deep forward lunge with hands inside front foot.",
+            "Drop inside elbow toward floor, pause for 2 seconds.",
+            "Reach that same arm to ceiling, rotating upper spine.",
+            "Straighten front leg to stretch hamstring, then switch sides."
+        ],
+        "images": [
+            f"{BASE_GITHUB_IMG}/Groin_Stretch/0.jpg",
+            f"{BASE_GITHUB_IMG}/Groin_Stretch/1.jpg"
+        ]
+    }
 ]
 
-WHY = {
-    "strength": (
-        "Resistance training is the backbone of fat loss, not cardio. In a calorie deficit it is what "
-        "tells your body to hold onto lean muscle and shed fat instead of the other way round. Keep the "
-        "rests short - that is what turns a strength session into a metabolic one."
-    ),
-    "hiit": (
-        "HIIT is a time-efficiency tool: roughly the same fat loss as steady cardio in about 40% of the time. "
-        "It is deliberately capped at 2 sessions per cycle - daily HIIT reliably leads to overtraining and "
-        "junk-intensity sessions."
-    ),
-    "zone2": (
-        "Low-intensity aerobic work burns a high proportion of fat, adds almost no recovery cost, and lets you "
-        "keep training hard on the other days. This is the session most people skip and most need."
-    ),
-    "metcon": (
-        "Mixed-modal conditioning keeps the heart rate high across a lot of muscle mass. High energy cost per "
-        "minute, and enough variety that you stay interested past week three."
-    ),
-    "recovery": (
-        "Fat loss happens while you recover, not while you train. Light movement raises your daily energy "
-        "burn (NEAT) without adding fatigue, and mobility work is what keeps the hard days available to you."
-    ),
-}
-
-STRENGTH_SCHEMES = [
-    ("4 sets x 8-10 reps", "RPE 8 - stop 2 reps short of failure - 60s rest"),
-    ("3 sets x 12-15 reps", "RPE 7-8 - lighter and faster - 45s rest"),
-    ("5 sets x 6-8 reps", "RPE 8-9 - heaviest scheme - 75s rest"),
-    ("3 sets x 10-12 reps", "RPE 8 - 2 seconds down, 1 second up - 50s rest"),
-    ("4 sets x 12 reps", "RPE 7-8 - constant tension, no lockout pauses - 45s rest"),
-]
-
-HIIT_PROTOCOLS = [
-    ("10 rounds: 30s hard / 30s easy", "Hard = ~90% effort. You should not be able to talk."),
-    ("8 rounds: 40s hard / 20s easy", "Short recovery - pace the first two rounds or you will die on round five."),
-    ("2 blocks of 8 x 20s / 10s (Tabata)", "3 minutes easy between blocks. Brutal and very short."),
-    ("8 rounds: 60s hard / 60s easy", "Longer intervals - hold a hard-but-repeatable pace, not a sprint."),
-    ("Pyramid: 15/30/45/60/45/30/15s hard", "Equal easy time after each. Two times through."),
-    ("12 rounds: 30s hard / 45s easy", "Higher volume, slightly more recovery. Keep every rep quality."),
-]
-
-ZONE2_DOSE = [
-    ("30 minutes continuous", "Heart rate 60-70% of max. You can hold a conversation the whole way."),
-    ("35 minutes continuous", "Nose-breathing pace. If you are mouth-breathing you are going too hard."),
-    ("40 minutes continuous", "Boring is the point. Put a podcast on."),
-    ("45 minutes continuous", "The longest steady piece - fuel with water and don't rush it."),
-]
-
-
-def _rng(date: _dt.date, salt: str = "") -> random.Random:
-    return random.Random(f"{date.isoformat()}|{salt}|vegfit-v2")
-
-
-class Picker:
-    """Draws movements for one session.
-
-    Two separate exclusion rules, and the distinction matters:
-
-    * ``used`` is a HARD rule - a movement already chosen for this session can
-      never be chosen again, so you never see the same exercise twice in one day
-      even when the equipment filter has left a pool almost empty.
-    * ``avoid`` is a SOFT rule - movements you did in the last few days go to the
-      back of the queue, but they are still available if the pool would otherwise
-      run dry.
+# ----------------------------------------------------------------------------------
+# Exercise Database Manager
+# ----------------------------------------------------------------------------------
+class ExerciseDB:
     """
+    Manages catalog of exercises, metadata, muscles, and animated demos.
+    Supports offline fallback and optional JSON loading from free-exercise-db.
+    """
+    def __init__(self):
+        self._exercises: Dict[str, Move] = {}
+        self.status: str = "Ready (Curated)"
 
-    def __init__(self, rng: random.Random, avoid: Iterable[str]) -> None:
-        self.rng = rng
-        self.avoid = set(avoid)
-        self.used: set[str] = set()
+    def load(self, json_path: Optional[str] = None):
+        """Loads curated catalog and supplements with free-exercise-db if available."""
+        for ex in CURATED_EXERCISES:
+            move = Move(
+                name=ex["name"],
+                db_id=ex["id"],
+                cue=ex.get("cue", ""),
+                note=ex.get("note", ""),
+                video_url=ex.get("video_url", ""),
+                equipment=ex.get("equipment", "body_only"),
+                category=ex.get("category", "strength"),
+                primary_muscles=ex.get("primaryMuscles", []),
+                secondary_muscles=ex.get("secondaryMuscles", []),
+                instructions=ex.get("instructions", []),
+                images=ex.get("images", [])
+            )
+            self._exercises[move.db_id] = move
 
-    def take(self, pool: Sequence[Move], n: int) -> list[Move]:
-        items = [m for m in pool if m.equip <= MY_EQUIPMENT and m.key not in self.used]
-        if not items:
-            return []
-        self.rng.shuffle(items)
-        fresh = [m for m in items if m.key not in self.avoid]
-        stale = [m for m in items if m.key in self.avoid]
-        out = (fresh + stale)[:n]
-        self.used.update(m.key for m in out)
-        return out
+        candidate_paths = [
+            json_path,
+            "exercises.json",
+            "dist/exercises.json",
+            os.path.expanduser("~/.cache/free-exercise-db/exercises.json")
+        ]
+        
+        for path in candidate_paths:
+            if path and os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        count = self._ingest_raw_json(data)
+                        self.status = f"Loaded {count} exercises from {os.path.basename(path)}"
+                        return
+                except Exception:
+                    pass
 
-    def one(self, pool: Sequence[Move]) -> Move | None:
-        got = self.take(pool, 1)
-        return got[0] if got else None
+        self.status = f"{len(self._exercises)} exercises indexed (Kettlebell & Functional DB)"
 
-    def choice(self, options: Sequence):
-        return options[self.rng.randrange(len(options))]
+    def _ingest_raw_json(self, raw_list: List[Dict]) -> int:
+        count = 0
+        for item in raw_list:
+            db_id = item.get("id") or item.get("name", "").lower().replace(" ", "_")
+            if not db_id:
+                continue
+            imgs = item.get("images", [])
+            full_imgs = [img if img.startswith("http") else f"{BASE_GITHUB_IMG}/{img.lstrip('/')}" for img in imgs]
+            move = Move(
+                name=item.get("name", db_id.replace("_", " ").title()),
+                db_id=db_id,
+                cue=item.get("instructions", ["Focus on clean posture and breathing."])[0] if item.get("instructions") else "Move with control.",
+                note=f"Equipment: {item.get('equipment', 'body only').title()}",
+                video_url=f"https://www.youtube.com/results?search_query={item.get('name', '').replace(' ', '+')}+exercise",
+                equipment=item.get("equipment", "body only").replace(" ", "_"),
+                category=item.get("category", "strength"),
+                primary_muscles=item.get("primaryMuscles", []),
+                secondary_muscles=item.get("secondaryMuscles", []),
+                instructions=item.get("instructions", []),
+                images=full_imgs
+            )
+            self._exercises[db_id] = move
+            count += 1
+        return count
+
+    def get_move(self, db_id: str) -> Optional[Move]:
+        return self._exercises.get(db_id)
+
+    def images(self, db_id: str) -> List[str]:
+        m = self.get_move(db_id)
+        return m.images if m else []
+
+    def instructions(self, db_id: str) -> List[str]:
+        m = self.get_move(db_id)
+        return m.instructions if m else []
+
+    def muscles(self, db_id: str) -> List[str]:
+        m = self.get_move(db_id)
+        return (m.primary_muscles + m.secondary_muscles) if m else []
+
+    def filter_moves(self, equipment_allowed: Set[str], category: Optional[str] = None) -> List[Move]:
+        matches = []
+        for m in self._exercises.values():
+            eq = m.equipment.lower().rstrip("s")
+            allowed = any(allowed_eq.lower().rstrip("s") in eq or eq in allowed_eq.lower().rstrip("s") for allowed_eq in equipment_allowed)
+            if allowed and (category is None or m.category.lower() == category.lower()):
+                matches.append(m)
+        return matches
+
+# ----------------------------------------------------------------------------------
+# Periodization & Plan Generator
+# ----------------------------------------------------------------------------------
+_DB_INSTANCE: Optional[ExerciseDB] = None
+
+def get_engine_db() -> ExerciseDB:
+    global _DB_INSTANCE
+    if _DB_INSTANCE is None:
+        _DB_INSTANCE = ExerciseDB()
+        _DB_INSTANCE.load()
+    return _DB_INSTANCE
 
 
-def _block(title: str, subtitle: str, items: list[Item]) -> Block | None:
-    """Blocks whose pool was emptied by the equipment filter are dropped."""
-    return Block(title, subtitle, items) if items else None
+def format_dose_and_detail(move: Move, kind: str) -> Tuple[str, str]:
+    """Generates dosage and weight recommendation based on movement & session intensity."""
+    name = move.name.lower()
+    is_kb = "kettlebell" in name or "kettlebell" in move.equipment.lower() or "kb_" in move.db_id
 
+    if kind == "strength":
+        if is_kb:
+            if any(w in name for w in ["swing", "deadlift", "squat", "carry", "gorilla"]):
+                return ("4 sets × 12 reps @ 20 lb", "Rest 75s · Focus on explosive hip drive")
+            elif any(w in name for w in ["halo", "windmill", "turkish", "press"]):
+                return ("3 sets × 8 reps/side @ 10 lb", "Rest 60s · Shoulder stability & packed lats")
+            else:
+                return ("3 sets × 10 reps/side @ 15 lb", "Rest 60s · Crisp lockouts & core control")
+        return ("3 sets × 12-15 reps", "Rest 60s · Slow 2-second negative")
 
-def _compact(blocks: Iterable[Block | None]) -> list[Block]:
-    return [b for b in blocks if b is not None]
-
-
-def _warmup(p: Picker) -> Block | None:
-    return _block(
-        "Warm-Up",
-        "5 minutes - do not skip this, it is where injuries don't happen",
-        [Item(m, "45 seconds", "Easy, building range each rep") for m in p.take(WARMUP, 5)],
-    )
-
-
-def _cooldown(p: Picker) -> Block | None:
-    return _block(
-        "Cool-Down",
-        "5 minutes - breathe out slowly, this is what drops your heart rate",
-        [Item(m, "40 seconds each side", "Stretch to mild tension, never to pain") for m in p.take(COOLDOWN, 5)],
-    )
-
-
-def _build(date: _dt.date, avoid: set[str]) -> Plan:
-    cycle_day = (date - CYCLE_EPOCH).days % len(CYCLE)
-    kind, title, focus, minutes = CYCLE[cycle_day]
-
-    # One picker for the whole session, so no movement can appear twice - not
-    # even across the main work and the cool-down on a mobility day.
-    p = Picker(_rng(date, kind), avoid)
-
-    warm = _warmup(Picker(_rng(date, "warmup"), avoid))
-    if warm:
-        p.used.update(i.move.key for i in warm.items)
-
-    if kind == "strength" and cycle_day == 0:
-        main = _full_body(p)
-    elif kind == "strength" and cycle_day == 3:
-        main = _upper(p)
-    elif kind == "strength":
-        main = _lower(p)
     elif kind == "hiit":
-        main = _hiit(p, alt=(cycle_day == 7))
+        if is_kb:
+            if "swing" in name:
+                return ("5 rounds: 40s work / 20s rest @ 20 lb", "Maximum hip snap on every rep")
+            return ("4 rounds: 30s work / 30s rest @ 10-15 lb", "Continuous rhythmic cadence")
+        return ("4 rounds: 40s work / 20s rest", "High speed & steady breathing")
+
     elif kind == "metcon":
-        main = _metcon(p)
+        if is_kb:
+            return ("4 rounds: 12 reps @ 15 lb", "Minimal rest between exercises · 90s round rest")
+        return ("4 rounds: 15 reps", "Continuous flow")
+
     elif kind == "zone2":
-        main = _zone2(p, long=(cycle_day == 8))
-    else:
-        main = _recovery(p)
+        return ("3 sets × 20 steady reps", "Maintain conversational breathing pace")
 
-    blocks = _compact([warm, *main, _cooldown(p)])
-    return Plan(date, cycle_day, kind, title, focus, minutes, blocks, WHY[kind])
+    else:  # recovery
+        return ("3 sets × 60s hold / flow", "Deep belly breathing into tight fascial lines")
 
 
-def _full_body(p: Picker) -> list[Block | None]:
-    dose, detail = p.choice(STRENGTH_SCHEMES)
-    picks = (
-        p.take(SQUAT, 1) + p.take(HINGE, 1) + p.take(PUSH_H, 1) + p.take(PULL, 1) + p.take(PUSH_V, 1)
-    )
-    fin = p.take(PLYO, 2) + p.take(CORE, 1)
-    return [
-        _block("Main Work - Circuit",
-               f"{dose}. Move between exercises with minimal rest, then rest 90s at the end of each round.",
-               [Item(m, dose, detail) for m in picks]),
-        _block("Finisher",
-               "3 rounds, 40 seconds on / 20 seconds off. This is the part that raises the calorie cost.",
-               [Item(m, "40 seconds", "All-out but controlled") for m in fin]),
-    ]
-
-
-def _upper(p: Picker) -> list[Block | None]:
-    dose, detail = p.choice(STRENGTH_SCHEMES)
-    a = p.take(PUSH_H, 1) + p.take(PULL, 1)
-    b = p.take(PUSH_V, 1) + p.take(PULL, 1)
-    arms = p.take(ARMS, 2)
-    core = p.take(CORE, 2)
-    return [
-        _block("Superset A - Push / Pull", f"{dose}. Alternate the two with no rest between them.",
-               [Item(m, dose, detail) for m in a]),
-        _block("Superset B - Shoulders / Back", "3 sets x 12 reps. Same deal - alternate, then 45s rest.",
-               [Item(m, "3 x 12", "RPE 7-8 - lighter weight, perfect form") for m in b]),
-        _block("Arms", "2 sets x 15 reps each, straight through.",
-               [Item(m, "2 x 15", "RPE 7 - burn, not grind - 30s rest") for m in arms]),
-        _block("Core Finisher", "3 rounds, minimal rest.",
-               [Item(m, "45 seconds", "Quality over speed") for m in core]),
-    ]
-
-
-def _lower(p: Picker) -> list[Block | None]:
-    dose, detail = p.choice(STRENGTH_SCHEMES)
-    sq = p.take(SQUAT, 2)
-    hi = p.take(HINGE, 2)
-    power = [(m, "30 seconds") for m in p.take(PLYO, 1)] + [(m, "45 seconds") for m in p.take(CARRY, 1)]
-    core = p.take(CORE, 2)
-    return [
-        _block("Knee-Dominant", f"{dose}.", [Item(m, dose, detail) for m in sq]),
-        _block("Hip-Dominant", "3 sets x 12 reps. Slow eccentric - 3 seconds lowering.",
-               [Item(m, "3 x 12", "RPE 8 - 60s rest") for m in hi]),
-        _block("Power + Carry", "3 rounds. Explosive work while you are still fresh enough to be explosive.",
-               [Item(m, d, "Land soft / walk tall") for m, d in power]),
-        _block("Core Finisher", "3 rounds, minimal rest.",
-               [Item(m, "45 seconds", "Brace, don't hold your breath") for m in core]),
-    ]
-
-
-def _hiit(p: Picker, alt: bool) -> list[Block | None]:
-    dose, detail = p.choice(HIIT_PROTOCOLS)
-    # Lead with the bag on the second HIIT day of the cycle, machines on the first,
-    # so the two HIIT slots never feel like the same session.
-    primary = p.one(BAG_WORK + CARDIO_HARD if alt else CARDIO_HARD + BAG_WORK)
-    second = p.one(CARDIO_HARD + BAG_WORK)
-    body = p.take(PLYO, 2) + p.take(CORE, 2)
-    return [
-        _block("Main Interval Set", detail,
-               [Item(primary, dose, "Warm up 3 min easy first")] if primary else []),
-        _block("Second Modality", "Switch machines - keeps the legs fresh enough to hold intensity.",
-               [Item(second, "6 rounds: 30s hard / 60s easy", "Slightly longer recovery here")] if second else []),
-        _block("Bodyweight Burnout", "2 rounds, 30 seconds on / 15 seconds off.",
-               [Item(m, "30 seconds", "Last 5 minutes - empty the tank") for m in body]),
-    ]
-
-
-def _metcon(p: Picker) -> list[Block | None]:
-    amrap = p.take(SQUAT, 1) + p.take(PUSH_H, 1) + p.take(PULL, 1) + p.take(CORE, 1)
-    emom = p.take(PLYO, 1) + p.take(HINGE, 1)
-    cond = p.one(CARDIO_HARD + BAG_WORK)
-    return [
-        _block("AMRAP 12",
-               "As many rounds as possible in 12 minutes: 10 reps of each, back to back. Log your rounds.",
-               [Item(m, "10 reps", "Break sets before you have to, not after") for m in amrap]),
-        _block("EMOM 10",
-               "Every minute on the minute for 10 minutes - alternate the two. Rest is whatever is left of the minute.",
-               [Item(m, "12 reps", "Aim for ~35 seconds of work") for m in emom]),
-        _block("Conditioning Cap", "One hard push to finish.",
-               [Item(cond, "5 minutes for max distance / rounds", "Negative split - second half faster")]
-               if cond else []),
-    ]
-
-
-def _zone2(p: Picker, long: bool) -> list[Block | None]:
-    primary = p.one(CARDIO_STEADY)
-    dose, detail = ZONE2_DOSE[p.rng.randrange(2, 4) if long else p.rng.randrange(0, 2)]
-    second = p.one(CARDIO_STEADY) if long else None
-    core = p.take(CORE, 3)
-    return [
-        _block("Steady State", detail,
-               [Item(primary, dose, "Zone 2 - RPE 4-5 out of 10")] if primary else []),
-        _block("Modality Swap", "Split the time across two machines - easier on the joints.",
-               [Item(second, "15 minutes continuous", "Same easy effort")] if second else []),
-        _block("Core Circuit", "3 rounds, 40 seconds each, 20 seconds rest.",
-               [Item(m, "40 seconds", "Slow and deliberate - you are not tired, so no excuses") for m in core]),
-    ]
-
-
-def _recovery(p: Picker) -> list[Block | None]:
-    easy = p.one(CARDIO_STEADY)
-    skill = p.one([m for m in BAG_WORK if m.key == "bag_technique"] or BAG_WORK)
-    mob = p.take(COOLDOWN, 6)
-    return [
-        _block("Easy Movement", "Genuinely easy. If you are breathing hard you have missed the point.",
-               [Item(easy, "20-25 minutes", "RPE 3 out of 10")] if easy else []),
-        _block("Skill Work (optional)", "Technique only - no power, no fatigue.",
-               [Item(skill, "3 rounds x 2 minutes", "Light contact, focus on footwork")] if skill else []),
-        _block("Extended Mobility", "Hold each for 60 seconds. This is the session, not a warm-up for one.",
-               [Item(m, "60 seconds", "Relax into it - tension defeats the stretch") for m in mob]),
-    ]
-
-
-def generate_plan(date: _dt.date) -> Plan:
-    """The plan for ``date``, avoiding movements used in the previous days.
-
-    Lookback is intentionally one level deep (previous days are generated with an
-    empty avoid-set) so this always terminates and stays deterministic.
+def generate_plan(target_date: dt.date) -> Plan:
     """
-    recent: set[str] = set()
+    Generates a deterministic workout plan for a given calendar date.
+    Calculates periodization kind, filters equipment (including 10, 15, 20 lb KBs),
+    and enforces anti-repeat window.
+    """
+    db = get_engine_db()
+    days_since_epoch = (target_date - EPOCH_DATE).days
+    cycle_day = days_since_epoch % len(CYCLE)
+    kind = CYCLE[cycle_day]
+
+    # Deterministic seed so plan remains stable across page refreshes
+    seed_val = int(target_date.strftime("%Y%m%d"))
+    rng = random.Random(seed_val)
+
+    # History anti-repeat filtering
+    recent_used_ids: Set[str] = set()
     for back in range(1, ANTI_REPEAT_DAYS + 1):
-        recent |= _build(date - _dt.timedelta(days=back), set()).main_keys
-    return _build(date, recent)
+        prev_date = target_date - dt.timedelta(days=back)
+        prev_seed = int(prev_date.strftime("%Y%m%d"))
+        prev_rng = random.Random(prev_seed)
+        available_prev = db.filter_moves(MY_EQUIPMENT)
+        if available_prev:
+            sampled = prev_rng.sample(available_prev, min(len(available_prev), 4))
+            recent_used_ids.update(m.db_id for m in sampled)
+
+    pool = [m for m in db.filter_moves(MY_EQUIPMENT) if m.db_id not in recent_used_ids]
+    if len(pool) < 4:
+        pool = db.filter_moves(MY_EQUIPMENT)
+
+    if kind == "strength":
+        title = "Functional Strength & Kettlebell Hypertrophy"
+        focus = "Progressive overload with 10, 15 & 20 lb kettlebells and bodyweight tension"
+        why = "Stimulates lean muscle retention, raises resting metabolic rate, and reinforces connective tissue."
+        minutes = 45
+        met_val = 5.5
+        
+        kb_moves = [m for m in pool if "kettlebell" in m.equipment.lower() or "kb_" in m.db_id]
+        main_picks = rng.sample(kb_moves, min(len(kb_moves), 3)) if kb_moves else []
+        remaining = [m for m in pool if m not in main_picks]
+        extra_picks = rng.sample(remaining, min(len(remaining), 2))
+        chosen_moves = main_picks + extra_picks
+
+        blocks = [
+            Block(
+                title="Block A · Movement Prep & Activation",
+                subtitle="Prime hips, thoracic spine, and shoulder joint stabilizers",
+                items=[Item(chosen_moves[0], "2 sets × 10 reps", "Active mobility & core priming")]
+            ),
+            Block(
+                title="Block B · Primary Kettlebell Strength",
+                subtitle="Heavy hinges, goblet squats, and unilateral loaded carries",
+                items=[Item(m, *format_dose_and_detail(m, kind)) for m in chosen_moves[1:4]]
+            ),
+            Block(
+                title="Block C · Core & Posterior Armor",
+                subtitle="Anti-rotation and rotational endurance",
+                items=[Item(chosen_moves[-1], *format_dose_and_detail(chosen_moves[-1], kind))]
+            )
+        ]
+
+    elif kind == "hiit":
+        title = "Kettlebell Swing & Cardiovascular Interval Blast"
+        focus = "High velocity hip snap (20 lb), explosive transitions, and anaerobic threshold"
+        why = "Ignites excess post-exercise oxygen consumption (EPOC) to accelerate 24-hour fat oxidation."
+        minutes = 30
+        met_val = 9.0
+
+        shuffled = list(pool)
+        rng.shuffle(shuffled)
+        picks = shuffled[:4]
+
+        blocks = [
+            Block(
+                title="Dynamic Warmup",
+                subtitle="Elevate heart rate and grease groove patterns",
+                items=[Item(picks[0], "3 minutes continuous flow", "Build steady body heat")]
+            ),
+            Block(
+                title="High Intensity Interval Circuit (4-5 Rounds)",
+                subtitle="Alternate ballistic kettlebell work with bodyweight tempo",
+                items=[Item(m, *format_dose_and_detail(m, kind)) for m in picks[1:]]
+            )
+        ]
+
+    elif kind == "metcon":
+        title = "Metabolic Conditioning Kettlebell Complex"
+        focus = "Continuous work capacity, lactate buffering, and full-body synergy"
+        why = "Bridges strength and cardiovascular capacity without catabolic muscle loss."
+        minutes = 35
+        met_val = 8.0
+
+        shuffled = list(pool)
+        rng.shuffle(shuffled)
+        picks = shuffled[:4]
+
+        blocks = [
+            Block(
+                title="Warmup Primer",
+                subtitle="Lubricate joints and rehearse rack position",
+                items=[Item(picks[0], "2 sets × 8 reps", "Smooth control")]
+            ),
+            Block(
+                title="The Complex (Density Rounds)",
+                subtitle="Move directly from exercise to exercise; rest 90s only at end of round",
+                items=[Item(m, *format_dose_and_detail(m, kind)) for m in picks[1:]]
+            )
+        ]
+
+    elif kind == "zone2":
+        title = "Aerobic Base & Steady-State Conditioning"
+        focus = "Sub-lactate threshold cadence, mitochondrial density, and fat oxidation"
+        why = "Builds the aerobic engine required to recover quickly between heavy strength sets."
+        minutes = 40
+        met_val = 6.5
+
+        shuffled = list(pool)
+        rng.shuffle(shuffled)
+        picks = shuffled[:3]
+
+        blocks = [
+            Block(
+                title="Aerobic Movement Circuit",
+                subtitle="Keep heart rate strictly in Zone 2 (nasal breathing / conversational pace)",
+                items=[Item(m, *format_dose_and_detail(m, kind)) for m in picks]
+            )
+        ]
+
+    else:  # recovery
+        title = "Joint Mobility & Parasympathetic Decompression"
+        focus = "Hip capsule mobility, spinal articulation, and tissue restoration"
+        why = "Downregulates nervous system stress and prepares neuromuscular system for the next cycle."
+        minutes = 25
+        met_val = 2.8
+
+        rec_moves = [m for m in db.filter_moves(MY_EQUIPMENT, category="stretching")] or pool[:3]
+        picks = rec_moves[:3]
+
+        blocks = [
+            Block(
+                title="Restorative Flow",
+                subtitle="Hold each posture with calm nasal breathing",
+                items=[Item(m, *format_dose_and_detail(m, kind)) for m in picks]
+            )
+        ]
+
+    # MET-based calorie estimate calculation
+    kg_weight = BODY_WEIGHT_LB * 0.453592
+    hours = minutes / 60.0
+    baseline_kcal = int(met_val * kg_weight * hours)
+    lo = int(baseline_kcal * 0.90)
+    hi = int(baseline_kcal * 1.15)
+
+    return Plan(
+        date=target_date,
+        kind=kind,
+        title=title,
+        focus=focus,
+        why=why,
+        minutes=minutes,
+        calorie_estimate=(lo, hi),
+        cycle_day=cycle_day,
+        blocks=blocks
+    )
 
 
-def upcoming(date: _dt.date, days: int = 7) -> list[Plan]:
-    return [generate_plan(date + _dt.timedelta(days=i)) for i in range(days)]
+def upcoming(start_date: dt.date, num_days: int = 7) -> List[PlanSummary]:
+    """Generates preview summaries for the upcoming N days for the top outlook bar."""
+    summaries = []
+    for i in range(num_days):
+        d = start_date + dt.timedelta(days=i)
+        p = generate_plan(d)
+        summaries.append(PlanSummary(date=d, kind=p.kind, title=p.title))
+    return summaries
